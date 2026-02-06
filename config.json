@@ -1,0 +1,27 @@
+{
+  "runner": {
+    "poll_interval_sec": 2,
+    "task_timeout_sec": 1800
+  },
+  "providers": {
+    "codex": {
+      "command": [
+        "codex",
+        "exec",
+        "--full-auto",
+        "--cd",
+        "{repo_path}",
+        "{prompt}"
+      ]
+    },
+    "claude": {
+      "command": [
+        "claude",
+        "-p",
+        "--permission-mode",
+        "bypassPermissions",
+        "{prompt}"
+      ]
+    }
+  }
+}
