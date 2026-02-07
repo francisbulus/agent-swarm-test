@@ -19,6 +19,7 @@ Lightweight task-queue runner for coordinating a swarm of coding agents.
 - `swarm/prompts/`: role prompt templates
 - `swarm/state/swarm.db`: task database
 - `swarm/runs/`: task artifacts and logs
+- `swarm/sessions/`: persistent session handoff logs
 
 ## Quickstart
 
@@ -52,6 +53,34 @@ python3 swarm_runner.py enqueue \
   --repo-path /absolute/path/to/repo \
   --prompt "Fix failing tests for payment retry logic"
 ```
+
+## Session Handoff Flow
+
+Use this when ending work so the next session can resume quickly.
+
+```bash
+# Start a new session log
+python3 swarm_runner.py session start \
+  --goal "Ship retry behavior for billing API" \
+  --repo-path /absolute/path/to/repo \
+  --context "Investigating flaky test in payment retries."
+
+# Add progress notes during the session
+python3 swarm_runner.py session note \
+  --text "Confirmed failure occurs when retry header is missing."
+
+# Close with handoff summary + next actions
+python3 swarm_runner.py session close \
+  --summary "Added retry header fallback and tests are green." \
+  --next-step "Run reviewer pass on error handling paths" \
+  --next-step "Merge after reviewer approval"
+
+# Show latest session log for resume
+python3 swarm_runner.py session show
+```
+
+Session logs are written to `sessions/session-<UTC timestamp>.md`.  
+The active session pointer is `sessions/.current`.
 
 ## Configure Provider Commands
 

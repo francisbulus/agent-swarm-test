@@ -21,6 +21,8 @@ SWARM_DIR = Path(__file__).resolve().parent
 DB_PATH = SWARM_DIR / "state" / "swarm.db"
 RUNS_DIR = SWARM_DIR / "runs"
 CONFIG_PATH = SWARM_DIR / "config.json"
+SESSIONS_DIR = SWARM_DIR / "sessions"
+CURRENT_SESSION_POINTER = SESSIONS_DIR / ".current"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "runner": {
@@ -112,9 +114,160 @@ def connect_db(path: Path) -> sqlite3.Connection:
 
 def init_storage(db_path: Path) -> None:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with connect_db(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+
+
+def make_session_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+
+
+def detect_git_branch(repo_path: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            branch = proc.stdout.strip()
+            if branch:
+                return branch
+    except FileNotFoundError:
+        pass
+    return "unknown"
+
+
+def set_current_session(session_path: Path) -> None:
+    relative_name = session_path.name
+    CURRENT_SESSION_POINTER.write_text(f"{relative_name}\n", encoding="utf-8")
+
+
+def resolve_session_path(session_file: str | None) -> Path:
+    if session_file:
+        explicit = Path(session_file).resolve()
+        if explicit.exists():
+            return explicit
+        raise ValueError(f"Session file not found: {explicit}")
+
+    if CURRENT_SESSION_POINTER.exists():
+        pointer_value = CURRENT_SESSION_POINTER.read_text(encoding="utf-8").strip()
+        if pointer_value:
+            candidate = (SESSIONS_DIR / pointer_value).resolve()
+            if candidate.exists():
+                return candidate
+
+    candidates = sorted(SESSIONS_DIR.glob("session-*.md"))
+    if candidates:
+        return candidates[-1].resolve()
+
+    raise ValueError(
+        "No session log found. Start one with "
+        "'python3 swarm_runner.py session start --goal \"...\"'."
+    )
+
+
+def update_session_metadata(session_path: Path, key: str, value: str) -> None:
+    lines = session_path.read_text(encoding="utf-8").splitlines()
+    prefix = f"- {key}:"
+
+    for idx, line in enumerate(lines):
+        if line.startswith(prefix):
+            lines[idx] = f"{prefix} {value}"
+            break
+    else:
+        insert_at = 1
+        while insert_at < len(lines) and lines[insert_at].startswith("- "):
+            insert_at += 1
+        lines.insert(insert_at, f"{prefix} {value}")
+
+    session_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def append_session_lines(session_path: Path, lines: list[str]) -> None:
+    prefix = "" if session_path.read_text(encoding="utf-8").endswith("\n") else "\n"
+    with session_path.open("a", encoding="utf-8") as handle:
+        handle.write(prefix)
+        handle.write("\n".join(lines).rstrip())
+        handle.write("\n")
+
+
+def start_session(args: argparse.Namespace) -> Path:
+    now = utc_now()
+    session_id = make_session_id()
+    repo_path = Path(args.repo_path).resolve()
+    branch = args.branch or detect_git_branch(repo_path)
+    context = args.context.strip() if args.context else "TBD"
+    owner = args.owner.strip() if args.owner else "codex"
+
+    session_path = SESSIONS_DIR / f"session-{session_id}.md"
+    content = "\n".join(
+        [
+            f"# Session {session_id}",
+            f"- Status: open",
+            f"- Owner: {owner}",
+            f"- Started: {now}",
+            f"- Last Updated: {now}",
+            f"- Repo Path: {repo_path}",
+            f"- Branch: {branch}",
+            f"- Goal: {args.goal.strip()}",
+            "",
+            "## Context",
+            context,
+            "",
+            "## Next Steps",
+            "- Capture the next concrete implementation step.",
+            "",
+            "## Timeline",
+            f"- [{now}] Session opened.",
+        ]
+    )
+    session_path.write_text(content + "\n", encoding="utf-8")
+    set_current_session(session_path)
+    return session_path
+
+
+def note_session(args: argparse.Namespace) -> Path:
+    session_path = resolve_session_path(args.session_file)
+    now = utc_now()
+    update_session_metadata(session_path, "Last Updated", now)
+    append_session_lines(session_path, [f"- [{now}] {args.text.strip()}"])
+    return session_path
+
+
+def close_session(args: argparse.Namespace) -> Path:
+    session_path = resolve_session_path(args.session_file)
+    now = utc_now()
+
+    summary = args.summary.strip()
+    next_steps = args.next_step or []
+    handoff_lines = [
+        f"## Handoff ({now})",
+        f"Summary: {summary}",
+        "Next Steps:",
+    ]
+    if next_steps:
+        handoff_lines.extend([f"- {item.strip()}" for item in next_steps])
+    else:
+        handoff_lines.append("- TBD")
+
+    append_session_lines(session_path, handoff_lines)
+    update_session_metadata(session_path, "Status", "closed")
+    update_session_metadata(session_path, "Closed", now)
+    update_session_metadata(session_path, "Last Updated", now)
+    return session_path
+
+
+def show_session(args: argparse.Namespace) -> Path:
+    session_path = resolve_session_path(args.session_file)
+    text = session_path.read_text(encoding="utf-8")
+    print(f"# session_file\n{session_path}\n")
+    print(text.rstrip())
+    return session_path
 
 
 def read_prompt(args: argparse.Namespace) -> str:
@@ -476,6 +629,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep polling for new tasks",
     )
 
+    session_cmd = subparsers.add_parser("session", help="Manage session handoff logs")
+    session_sub = session_cmd.add_subparsers(dest="session_action", required=True)
+
+    session_start = session_sub.add_parser("start", help="Start a new session log")
+    session_start.add_argument("--goal", required=True, help="Session objective")
+    session_start.add_argument("--repo-path", default=".", help="Repo path for this session")
+    session_start.add_argument("--branch", help="Branch name (auto-detects if omitted)")
+    session_start.add_argument("--owner", default="codex", help="Owner label")
+    session_start.add_argument("--context", default="", help="Starting context summary")
+
+    session_note = session_sub.add_parser("note", help="Append a note to the active session")
+    session_note.add_argument("--text", required=True, help="Progress note")
+    session_note.add_argument("--session-file", help="Specific session file to update")
+
+    session_close = session_sub.add_parser("close", help="Close a session with handoff")
+    session_close.add_argument("--summary", required=True, help="Final summary")
+    session_close.add_argument(
+        "--next-step",
+        action="append",
+        default=[],
+        help="Action item for the next session (repeatable)",
+    )
+    session_close.add_argument("--session-file", help="Specific session file to close")
+
+    session_show = session_sub.add_parser("show", help="Print the latest session log")
+    session_show.add_argument("--session-file", help="Specific session file to show")
+
     return parser
 
 
@@ -534,6 +714,28 @@ def main() -> None:
         rows = list_tasks(db_path, args.status, args.limit)
         print_rows(rows)
         return
+
+    if args.command == "session":
+        if args.session_action == "start":
+            session_path = start_session(args)
+            print(f"Started session log: {session_path}")
+            return
+
+        if args.session_action == "note":
+            session_path = note_session(args)
+            print(f"Updated session log: {session_path}")
+            return
+
+        if args.session_action == "close":
+            session_path = close_session(args)
+            print(f"Closed session log: {session_path}")
+            return
+
+        if args.session_action == "show":
+            show_session(args)
+            return
+
+        raise RuntimeError(f"Unknown session action: {args.session_action}")
 
     if args.command == "run":
         config = load_config(config_path)

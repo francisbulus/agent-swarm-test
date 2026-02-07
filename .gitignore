@@ -1,2 +1,4 @@
 state/*.db
 runs/task-*/
+sessions/.current
+sessions/session-*.md
